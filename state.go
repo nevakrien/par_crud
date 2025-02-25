@@ -5,19 +5,20 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const cleanupFreq int64 = 100
 
-// Node holds a dead flag, text, name, a map of children (atomic pointers),
-// and a cleanup counter (signed). Cleanup is handled entirely at the node level.
 type Node struct {
 	dead           atomic.Bool
 	lock           sync.RWMutex
+	
 	text           string
 	name           string
 	children       map[string]*atomic.Pointer[Node]
-	cleanupCounter atomic.Int64
+	
+	cleanupCounter atomic.Int64 //used so we periodically clear the internal table (otherwise we leak memory)
 }
 
 // NewNode creates a new Node.
@@ -58,17 +59,16 @@ func (node *Node) getAndResetDead(ptr *atomic.Pointer[Node]) (*Node, bool) {
 // conditionalCleanup calls cleanup if shouldCleanup is true.
 func (node *Node) conditionalCleanup(shouldCleanup bool) {
 	if shouldCleanup {
-		currentCount := node.cleanupCounter.Load()
-		node.cleanup(currentCount)
+		node.cleanup()
 	}
 }
 
 // cleanup performs a full cleanup of the children map under a write lock.
-// WARNING: Do not call this while holding a read lock.
-func (node *Node) cleanup(currentCount int64) {
+// WARNING: This method acquires a write lock. Do not call it while holding a read lock.
+func (node *Node) cleanup() {
 	node.lock.Lock()
 	defer node.lock.Unlock()
-	currentCount = node.cleanupCounter.Load()
+	currentCount := node.cleanupCounter.Load()
 	for key, ptr := range node.children {
 		if ptr.Load() == nil {
 			delete(node.children, key)
@@ -78,7 +78,7 @@ func (node *Node) cleanup(currentCount int64) {
 	node.cleanupCounter.Add(-delta)
 }
 
-// child retrieves a child by name using getAndResetDead and then conditionally cleans up.
+// child retrieves a child by name using getAndResetDead.
 func (node *Node) child(childName string) *Node {
 	node.lock.RLock()
 	ptr, exists := node.children[childName]
@@ -87,6 +87,7 @@ func (node *Node) child(childName string) *Node {
 		return nil
 	}
 	child, cleanupNeeded := node.getAndResetDead(ptr)
+	// Call conditionalCleanup after releasing the lock.
 	node.conditionalCleanup(cleanupNeeded)
 	return child
 }
@@ -94,28 +95,32 @@ func (node *Node) child(childName string) *Node {
 // getValidChildren iterates over the children map in a single loop,
 // calling getAndResetDead for each pointer and deleting entries that become nil.
 // It then conditionally cleans up.
+// The deferred anonymous function ensures that conditionalCleanup is called after the lock is released.
 func (node *Node) getValidChildren() []*Node {
 	var cleanupNeeded bool = false
-	defer node.conditionalCleanup(cleanupNeeded)
-	
-	node.lock.Lock()
-	defer node.lock.Unlock()
+	// Call conditionalCleanup once after we release the lock
+	defer func() {
+		node.conditionalCleanup(cleanupNeeded)
+	}()
+
+	node.lock.RLock()
+	defer node.lock.RUnlock()
 	var valid []*Node
-	for key, ptr := range node.children {
+	for _, ptr := range node.children {
 		child, needCleanup := node.getAndResetDead(ptr)
 		if needCleanup {
 			cleanupNeeded = true
 		}
-		if child == nil {
-			delete(node.children, key)
-		} else {
+		if child !=nil {
 			valid = append(valid, child)
 		}
 	}
 	return valid
 }
 
+//
 // State holds all live nodes. A node is marked dead only after removal from State.
+//
 type State struct {
 	nodes sync.Map // map[string]*Node
 }
@@ -167,7 +172,7 @@ func (state *State) show(name string) string {
 		ans += " None"
 	} else {
 		for _, child := range children {
-			ans += "\n - " + child.text
+			ans += "\n - " + child.name
 		}
 	}
 	return ans
@@ -176,15 +181,27 @@ func (state *State) show(name string) string {
 func main() {
 	st := &State{}
 
+	// Create parent and some children.
 	st.create("A", "Parent Node")
-	st.create("B", "Child Node 1")
-	st.create("C", "Child Node 2")
-	st.connect("A", "B")
-	st.connect("A", "C")
+	// Create 200 children for node A.
+	for i := 1; i <= 200; i++ {
+		childName := fmt.Sprintf("B%d", i)
+		st.create(childName, fmt.Sprintf("Child Node %d", i))
+		st.connect("A", childName)
+	}
 
+	fmt.Println("Before deletion, A's children:")
 	fmt.Println(st.show("A"))
 
-	st.remove("B")
-	fmt.Println("\nAfter removing Child Node 1:")
+	// Remove all children from A to simulate garbage.
+	for i := 1; i <= 200; i++ {
+		childName := fmt.Sprintf("B%d", i)
+		st.remove(childName)
+	}
+
+	// Allow some time for goroutines to run (if any) and cleanup to be triggered.
+	time.Sleep(100 * time.Millisecond)
+
+	fmt.Println("\nAfter removal of children, A's children (cleanup should trigger):")
 	fmt.Println(st.show("A"))
 }
