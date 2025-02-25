@@ -7,18 +7,20 @@ import (
 	"sync/atomic"
 )
 
-const cleanupFreq uint64 = 100
+const cleanupFreq int64 = 100
 
-
+// Node holds a dead flag, text, name, a map of children (atomic pointers),
+// and a cleanup counter (signed). Cleanup is handled entirely at the node level.
 type Node struct {
 	dead           atomic.Bool
 	lock           sync.RWMutex
 	text           string
 	name           string
 	children       map[string]*atomic.Pointer[Node]
-	cleanupCounter atomic.Uint64
+	cleanupCounter atomic.Int64
 }
 
+// NewNode creates a new Node.
 func NewNode(name, text string) *Node {
 	return &Node{
 		name:     name,
@@ -38,20 +40,45 @@ func (node *Node) addChild(child *Node) {
 
 // getAndResetDead checks if the given pointer's Node is dead.
 // If dead, it atomically resets the pointer to nil, increments the cleanup counter,
-// and triggers maybeCleanup. This is an internal helper.
-func (node *Node) getAndResetDead(ptr *atomic.Pointer[Node]) *Node {
+// and returns (nil, true) if the cleanup condition is met.
+func (node *Node) getAndResetDead(ptr *atomic.Pointer[Node]) (*Node, bool) {
 	child := ptr.Load()
 	if child != nil && child.dead.Load() {
 		if ptr.CompareAndSwap(child, nil) {
 			newCount := node.cleanupCounter.Add(1)
-			node.maybeCleanup(newCount)
+			if newCount%cleanupFreq == 0 && newCount > 2*int64(len(node.children)) {
+				return nil, true
+			}
 		}
-		return nil
+		return nil, false
 	}
-	return child
+	return child, false
 }
 
-// child retrieves a child by name, using getAndResetDead.
+// conditionalCleanup calls cleanup if shouldCleanup is true.
+func (node *Node) conditionalCleanup(shouldCleanup bool) {
+	if shouldCleanup {
+		currentCount := node.cleanupCounter.Load()
+		node.cleanup(currentCount)
+	}
+}
+
+// cleanup performs a full cleanup of the children map under a write lock.
+// WARNING: Do not call this while holding a read lock.
+func (node *Node) cleanup(currentCount int64) {
+	node.lock.Lock()
+	defer node.lock.Unlock()
+	currentCount = node.cleanupCounter.Load()
+	for key, ptr := range node.children {
+		if ptr.Load() == nil {
+			delete(node.children, key)
+		}
+	}
+	delta := currentCount - (currentCount % cleanupFreq)
+	node.cleanupCounter.Add(-delta)
+}
+
+// child retrieves a child by name using getAndResetDead and then conditionally cleans up.
 func (node *Node) child(childName string) *Node {
 	node.lock.RLock()
 	ptr, exists := node.children[childName]
@@ -59,17 +86,26 @@ func (node *Node) child(childName string) *Node {
 	if !exists {
 		return nil
 	}
-	return node.getAndResetDead(ptr)
+	child, cleanupNeeded := node.getAndResetDead(ptr)
+	node.conditionalCleanup(cleanupNeeded)
+	return child
 }
 
-// getValidChildren iterates over the entire children map (in a single loop)
-// calling getAndResetDead for each pointer, and removes entries whose pointer is nil.
+// getValidChildren iterates over the children map in a single loop,
+// calling getAndResetDead for each pointer and deleting entries that become nil.
+// It then conditionally cleans up.
 func (node *Node) getValidChildren() []*Node {
+	var cleanupNeeded bool = false
+	defer node.conditionalCleanup(cleanupNeeded)
+	
 	node.lock.Lock()
 	defer node.lock.Unlock()
 	var valid []*Node
 	for key, ptr := range node.children {
-		child := node.getAndResetDead(ptr)
+		child, needCleanup := node.getAndResetDead(ptr)
+		if needCleanup {
+			cleanupNeeded = true
+		}
 		if child == nil {
 			delete(node.children, key)
 		} else {
@@ -79,29 +115,7 @@ func (node *Node) getValidChildren() []*Node {
 	return valid
 }
 
-// maybeCleanup performs a full cleanup of the children map if:
-//    (counter % cleanupFreq == 0) && (counter > 2×(number of children))
-// WARNING: This method acquires a write lock. Do not call it while holding a read lock.
-func (node *Node) maybeCleanup(currentCount uint64) {
-	if currentCount%cleanupFreq != 0 || currentCount <= 2*uint64(len(node.children)) {
-		return
-	}
-	node.lock.Lock()
-	defer node.lock.Unlock()
-	currentCount = node.cleanupCounter.Load()
-	if currentCount%cleanupFreq != 0 || currentCount <= 2*uint64(len(node.children)) {
-		return
-	}
-	for key, ptr := range node.children {
-		if ptr.Load() == nil {
-			delete(node.children, key)
-		}
-	}
-	delta := currentCount - (currentCount % cleanupFreq)
-	// Subtract delta from the counter (this is equivalent to counter = counter % cleanupFreq).
-	node.cleanupCounter.Add(^(delta - 1))
-}
-
+// State holds all live nodes. A node is marked dead only after removal from State.
 type State struct {
 	nodes sync.Map // map[string]*Node
 }
